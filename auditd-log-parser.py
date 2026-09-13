@@ -118,6 +118,11 @@ SIGNAME = {1: "SIGHUP", 2: "SIGINT", 3: "SIGQUIT", 4: "SIGILL", 5: "SIGTRAP",
            13: "SIGPIPE", 24: "SIGXCPU", 25: "SIGXFSZ", 31: "SIGSYS"}
 UNSET_UID = "4294967295"          # auid/ses "not set" sentinel
 ESCALATION_TOOLS = frozenset(("sudo", "su", "sudo-rs", "doas"))
+# session_open records from these never mean "someone logged in" -- they're
+# systemd opening its own per-user manager instance (linger / autostart at
+# boot), not a credential check. Everything else that opens a PAM session
+# (sddm-helper, gdm's worker, lightdm, login, sshd-session, ...) does mean it.
+NONINTERACTIVE_SESSION_EXE = frozenset(("systemd-executor", "systemd"))
 # How many still-open events to keep buffered before flushing the oldest.
 # The interleave window in practice is a handful of events; this is generous.
 PENDING_LAG = 500
@@ -707,6 +712,17 @@ class Model:
         elif rec_type == "USER_START":
             s = self._session(ses, ts)
             self._apply_acct_hint(s, pid, ts)
+            # A display-manager greeter (sddm-helper, gdm's worker, lightdm,
+            # ...) opens a session without ever sending USER_LOGIN and often
+            # with no tty (a graphical seat, not a serial console) -- so
+            # without this it never counts as a "login" at all (see
+            # NONINTERACTIVE_SESSION_EXE / ESCALATION_TOOLS for what's excluded).
+            if tool and tool not in ESCALATION_TOOLS and tool not in NONINTERACTIVE_SESSION_EXE:
+                s["interactive"] = True
+                s.setdefault("via", tool)          # e.g. "sddm-helper"
+                if term:                           # e.g. "/dev/tty1" -- no
+                    s.setdefault("tty", term)       # addr on a local seat, so
+                                                     # this is the only source
         elif rec_type == "USER_END":
             if tool in ESCALATION_TOOLS:
                 return                              # a sudo/su session closing
