@@ -103,6 +103,8 @@ One row per record, newest first by default. A `!` in `#` and a red row mean
 `classify_danger()` flagged it (see below); `type` says what kind of record
 it is — `exec`, `watch`, `account`, `service`, `config`, or `anomaly`.
 
+![Main table](images/main-table.png)
+
 ```text
 auditd-log-parser  --  5 records   !2 flagged
 # [1] v  | type [[]  | time [2]            | exe [3]                        | commandline [4]                                | ses [5]    | key [6]            | result [7]             | uid [8]              | parent command [9]   | parent exe [0]               | pid [-]    | ppid [=]
@@ -151,6 +153,8 @@ table, because they naturally aggregate rather than list one row per record.
 Both tables are grouped — logins by user + source (SSH forced-command setups
 open one session per command), failures by account + source — so a
 brute-force is one line, not two hundred:
+
+![Sessions and auth failures](images/sessions.png)
 
 ```text
 LOGIN SESSIONS  (12, from 1 user/source pairs)
