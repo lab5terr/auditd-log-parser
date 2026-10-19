@@ -118,11 +118,13 @@ SIGNAME = {1: "SIGHUP", 2: "SIGINT", 3: "SIGQUIT", 4: "SIGILL", 5: "SIGTRAP",
            13: "SIGPIPE", 24: "SIGXCPU", 25: "SIGXFSZ", 31: "SIGSYS"}
 UNSET_UID = "4294967295"          # auid/ses "not set" sentinel
 ESCALATION_TOOLS = frozenset(("sudo", "su", "sudo-rs", "doas"))
-# session_open records from these never mean "someone logged in" -- they're
-# systemd opening its own per-user manager instance (linger / autostart at
-# boot), not a credential check. Everything else that opens a PAM session
-# (sddm-helper, gdm's worker, lightdm, login, sshd-session, ...) does mean it.
-NONINTERACTIVE_SESSION_EXE = frozenset(("systemd-executor", "systemd"))
+# session_open records from these never mean "someone logged in" -- systemd
+# opening its own per-user manager instance (linger / autostart at boot) or
+# a scheduler running a job, not a credential check. Everything else that
+# opens a PAM session (sddm-helper, gdm's worker, lightdm, login,
+# sshd-session, xrdp-sesexec, ...) does mean it.
+NONINTERACTIVE_SESSION_EXE = frozenset(("systemd-executor", "systemd",
+                                        "crond", "cron", "atd", "anacron"))
 # How many still-open events to keep buffered before flushing the oldest.
 # The interleave window in practice is a handful of events; this is generous.
 PENDING_LAG = 500
@@ -133,9 +135,12 @@ ENRICHED_KEY = {
 }
 
 ERRNO = {
-    1: "EPERM", 2: "ENOENT", 5: "EIO", 8: "ENOEXEC", 9: "EBADF", 11: "EAGAIN",
-    12: "ENOMEM", 13: "EACCES", 14: "EFAULT", 20: "ENOTDIR", 21: "EISDIR",
-    22: "EINVAL", 26: "ETXTBSY", 36: "ENAMETOOLONG", 40: "ELOOP",
+    1: "EPERM", 2: "ENOENT", 3: "ESRCH", 4: "EINTR", 5: "EIO", 8: "ENOEXEC",
+    9: "EBADF", 11: "EAGAIN", 12: "ENOMEM", 13: "EACCES", 14: "EFAULT",
+    16: "EBUSY", 17: "EEXIST", 18: "EXDEV", 19: "ENODEV", 20: "ENOTDIR",
+    21: "EISDIR", 22: "EINVAL", 24: "EMFILE", 26: "ETXTBSY", 28: "ENOSPC",
+    30: "EROFS", 32: "EPIPE", 36: "ENAMETOOLONG", 39: "ENOTEMPTY", 40: "ELOOP",
+    95: "EOPNOTSUPP", 98: "EADDRINUSE", 110: "ETIMEDOUT", 111: "ECONNREFUSED",
 }
 
 _uid_cache = {}
@@ -282,8 +287,10 @@ def clean_val(val):
 
 
 def field_str(val):
-    """clean_val, but also hex-decode -- auditd hex-encodes e.g. acct when it
-    holds "(invalid user)" or a name with spaces."""
+    """clean_val, but also hex-decode -- auditd hex-encodes the untrusted-string
+    fields (acct, exe, comm, ...) when they hold "(invalid user)" or a name with
+    spaces. Not for hostname/terminal/unit: those are never encoded, and an
+    all-hex value like "db01" would be mangled."""
     return clean_val(audit_decode(val, nul_to_space=True))
 
 
@@ -405,7 +412,10 @@ _DANGER_EXE = {
 _CMD_POS = r"(?:^|[;|&]\s*|\b(?:sudo|xargs|env)\s+|(?<!\S)-c\s+)"
 _DANGER_RULES = (
     (_CMD_POS + r"rm\s+(?:-\S+\s+)*(?:-[a-zA-Z]*r|--recursive\b)", "recursive rm"),
-    (_CMD_POS + r"(?:useradd|userdel|usermod|groupadd|passwd|chpasswd)\b", "account/password change"),
+    # (?![\w|.)-]) rather than \b: "(password|passwd|secret)" inside a script is
+    # a regex alternation, not `| passwd`
+    (_CMD_POS + r"(?:useradd|userdel|usermod|groupadd|passwd|chpasswd)(?![\w|.)-])",
+     "account/password change"),
     (_CMD_POS + r"mkfs(?:\.\w+)?\s",                     "filesystem format"),
     (r"\bdd\s[^|;&]*\bof=/dev/(?:sd|nvme|vd|hd|mmcblk)", "dd to raw disk"),
     (r">\s*/dev/(?:sd|nvme|vd|hd)[a-z]",                 "redirect to raw disk"),
@@ -531,7 +541,7 @@ class Model:
         self.proc_map = {}         # pid -> (comm, exe)
         self.sessions = []         # session dicts, in creation order
         self._open_ses = {}        # ses id -> the currently-open session dict
-        self._acct_hint = {}       # pid -> (ts, addr, host, tty) from a recent USER_ACCT
+        self._acct_hint = {}       # pid -> (ts, addr, host, tty, via) from a recent USER_ACCT
         self._last_reject = {}     # addr -> ts of the last real auth rejection
         self.auth_failures = []    # rejected/failed auth: USER_LOGIN/AUTH/ACCT/ERR
         self._pam_last = {}        # pid -> (ts, ok) of the LAST USER_AUTH seen
@@ -632,8 +642,8 @@ class Model:
         res = unq(f.get("res", ""))
         acct = field_str(f.get("acct"))
         addr = clean_val(f.get("addr"))
-        host = field_str(f.get("hostname"))
-        term = field_str(f.get("terminal"))
+        host = clean_val(f.get("hostname"))
+        term = clean_val(f.get("terminal"))
         tool = os.path.basename(clean_val(f.get("exe")))
         pid = to_int(f.get("pid"), -1)
 
@@ -712,17 +722,15 @@ class Model:
         elif rec_type == "USER_START":
             s = self._session(ses, ts)
             self._apply_acct_hint(s, pid, ts)
-            # A display-manager greeter (sddm-helper, gdm's worker, lightdm,
-            # ...) opens a session without ever sending USER_LOGIN and often
-            # with no tty (a graphical seat, not a serial console) -- so
-            # without this it never counts as a "login" at all (see
-            # NONINTERACTIVE_SESSION_EXE / ESCALATION_TOOLS for what's excluded).
+            # A display-manager greeter (sddm-helper, ...) opens a session
+            # without USER_LOGIN and with no tty on its LOGIN record, so this
+            # session_open is the only sign of a real login -- and the only
+            # source for via/tty (a local seat has no addr).
             if tool and tool not in ESCALATION_TOOLS and tool not in NONINTERACTIVE_SESSION_EXE:
                 s["interactive"] = True
-                s.setdefault("via", tool)          # e.g. "sddm-helper"
-                if term:                           # e.g. "/dev/tty1" -- no
-                    s.setdefault("tty", term)       # addr on a local seat, so
-                                                     # this is the only source
+                s.setdefault("via", tool)
+                if term:
+                    s.setdefault("tty", term)
         elif rec_type == "USER_END":
             if tool in ESCALATION_TOOLS:
                 return                              # a sudo/su session closing
@@ -761,7 +769,7 @@ class Model:
             emit("account", tool, "%s %s" % (op, target), res,
                  None if res == "success" else "failed account/group change")
         elif rec_type in SERVICE_RECORD_TYPES:
-            unit = field_str(f.get("unit")) or "-"
+            unit = clean_val(f.get("unit")) or "-"
             action = "started" if rec_type == "SERVICE_START" else "stopped"
             emit("service", "-", "%s %s" % (unit, action), res,
                  "audit service" if "audit" in unit.lower() else None)
@@ -1148,7 +1156,7 @@ def run_plain(model, sort_name, reverse, full, color="auto", flagged_only=False)
                          "open the TUI and press 's'\n" % len(model.auth_failures))
     if not events:
         sys.stderr.write("auditd-log-parser.py: no %sevents found\n"
-                         % ("flagged " if flagged_only else "execve "))
+                         % ("flagged " if flagged_only else ""))
 
 
 # --------------------------------------------------------------------------- #
@@ -1193,6 +1201,13 @@ _PALETTE = {
                   shade=254, title=(238, 253), header=25, status=(238, 252),
                   sel=(235, 152), danger=(88, 224), danger_sel=(224, 88)),
 }
+
+
+def set_cursor(visibility):
+    try:
+        curses.curs_set(visibility)
+    except curses.error:    # terminals without cursor-visibility support
+        pass
 
 
 def init_theme(mode):
@@ -1274,9 +1289,11 @@ KIND_LABELS = {
 
 
 class Tui:
-    def __init__(self, model, follower):
+    def __init__(self, model, follower, patterns=(), color_mode="auto"):
         self.model = model
         self.follower = follower
+        self.patterns = patterns        # what -f re-resolves to find the newest log
+        self.color_mode = color_mode
         self.sort_col = 0
         self.reverse = True
         self.filt = ""
@@ -1619,7 +1636,7 @@ class Tui:
 
     def prompt_filter(self, scr):
         curses.echo()
-        curses.curs_set(1)
+        set_cursor(1)
         h, w = scr.getmaxyx()
         self._put(scr, h - 1, 0, " " * (w - 1))
         self._put(scr, h - 1, 0, "filter: ")
@@ -1629,17 +1646,20 @@ class Tui:
         except curses.error:
             value = ""
         curses.noecho()
-        curses.curs_set(0)
+        set_cursor(0)
         self.filt = value.strip()
         self.cur = 0
         self.top = 0
 
     # -- main loop ------------------------------------------------- #
 
-    def run(self, scr):
-        curses.curs_set(0)
-        init_theme(getattr(self, "_color_mode", "auto"))
+    def _apply_timeout(self, scr):
         scr.timeout(500 if self.follower else -1)
+
+    def run(self, scr):
+        set_cursor(0)
+        init_theme(self.color_mode)
+        self._apply_timeout(scr)
         while True:
             if self.follower:
                 self.follower.poll()
@@ -1683,16 +1703,16 @@ class Tui:
                 self.top = 0
             elif ch in (ord("s"), ord("S")):
                 self.show_sessions(scr)
-                scr.timeout(500 if self.follower else -1)
+                self._apply_timeout(scr)
             elif ch in (ord("m"), ord("M")):
                 self.show_type_menu(scr)
                 self.cur = 0
                 self.top = 0
-                scr.timeout(500 if self.follower else -1)
+                self._apply_timeout(scr)
             elif ch in (10, 13, curses.KEY_ENTER):
                 if self.rows:
                     self.show_detail(scr, self.rows[self.cur])
-                    scr.timeout(500 if self.follower else -1)
+                    self._apply_timeout(scr)
             elif ch == ord("f"):
                 self._toggle_follow(scr)
             elif ch == ord("g"):
@@ -1716,7 +1736,7 @@ class Tui:
             self.follower = None
             scr.timeout(-1)
             return
-        paths = resolve_paths(self._patterns) if hasattr(self, "_patterns") else []
+        paths = resolve_paths(self.patterns)
         target = paths[-1] if paths else None
         if target:
             self.follower = Follower(self.model, target)
@@ -1738,7 +1758,7 @@ def main(argv=None):
     except locale.Error:
         pass
     parser = argparse.ArgumentParser(
-        description="Browse auditd execve events as a sortable table.")
+        description="Browse auditd logs as a sortable table.")
     parser.add_argument("paths", nargs="*", default=["/var/log/audit/audit.log"],
                         help="audit log file(s) or globs (default: /var/log/audit/audit.log; '-' = stdin)")
     parser.add_argument("-f", "--follow", action="store_true",
@@ -1761,7 +1781,7 @@ def main(argv=None):
     if os.environ.get("NO_COLOR") is not None and args.color == "auto":
         args.color = "off"
 
-    patterns = args.paths if args.paths else ["/var/log/audit/audit.log"]
+    patterns = args.paths
     paths = resolve_paths(patterns)
     if not paths:
         sys.stderr.write("auditd-log-parser.py: no readable log files\n")
@@ -1785,9 +1805,7 @@ def main(argv=None):
         if target:
             follower = Follower(model, target)
 
-    tui = Tui(model, follower)
-    tui._patterns = patterns
-    tui._color_mode = args.color
+    tui = Tui(model, follower, patterns, args.color)
     tui.only_flagged = args.flagged
     try:
         curses.wrapper(tui.run)
