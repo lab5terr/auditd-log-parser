@@ -117,7 +117,10 @@ SIGNAME = {1: "SIGHUP", 2: "SIGINT", 3: "SIGQUIT", 4: "SIGILL", 5: "SIGTRAP",
            6: "SIGABRT", 7: "SIGBUS", 8: "SIGFPE", 9: "SIGKILL", 11: "SIGSEGV",
            13: "SIGPIPE", 24: "SIGXCPU", 25: "SIGXFSZ", 31: "SIGSYS"}
 UNSET_UID = "4294967295"          # auid/ses "not set" sentinel
-ESCALATION_TOOLS = frozenset(("sudo", "su", "sudo-rs", "doas"))
+# Privilege-escalation tools: running one is flagged (classify_danger), and
+# their own PAM sessions are never logins nor a place to track a session end.
+ESCALATION_TOOLS = frozenset(("sudo", "su", "sudo-rs", "doas", "pkexec", "run0",
+                              "runuser"))
 # session_open records from these never mean "someone logged in" -- systemd
 # opening its own per-user manager instance (linger / autostart at boot) or
 # a scheduler running a job, not a credential check. Everything else that
@@ -463,6 +466,8 @@ def classify_danger(exe, cmd):
         label = "filesystem format"
     if label:
         seen.append(label)
+    if base in ESCALATION_TOOLS:
+        seen.append("privilege escalation")
 
     for rx, lab in _DANGER_RX:
         if lab not in seen and rx.search(text):

@@ -17,8 +17,9 @@ view instead, since they're naturally a summary rather than one row each.
 - **Flags what looks dangerous**: recursive `rm`, disk wipes, `curl | sh`,
   disabling auditd/the firewall, editing `sudoers`/`shadow`/`authorized_keys`,
   reverse shells, a failed account change, any kernel anomaly, tampering with
-  auditd's own configuration, and a `sudo`/`su`/`doas` command whose password
-  was actually wrong even though the process itself launched fine.
+  auditd's own configuration, every privilege-escalation command
+  (`sudo`, `su`, `doas`, `pkexec`, …), and one whose password was actually
+  wrong even though the process itself launched fine.
 - **Reconstructs login sessions** — who logged in, from where — and collects
   every failed authentication attempt, grouped so a brute-force is one line.
 
@@ -295,7 +296,13 @@ Some things are **always** flagged, regardless of success:
   services starting or stopping. Tampering with the audit trail is a classic
   way to cover tracks.
 - A kernel-flagged anomaly (`type: anomaly`), or a failed account/group change.
-- A `sudo`/`su`/`doas` row whose final password check was rejected (see above).
+- Any privilege-escalation tool being run — `sudo`, `sudo-rs`, `su`, `doas`,
+  `pkexec`, `run0`, `runuser` — labelled `privilege escalation`. Only the
+  escalation command itself is flagged (what it then ran is its own row), but
+  the `!` filter shows the whole session around it, so a session that used
+  `sudo` even once is kept.
+- A `sudo`/`su`/`doas` row whose final password check was rejected (see above)
+  gets an extra `authentication failed` label.
 
 It is a **triage aid, not a verdict** — expect the occasional benign match
 (a script whose text happens to contain `rm -rf`, or your own routine rule
